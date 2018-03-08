@@ -1,4 +1,6 @@
 #include <CurieBLE.h>
+#include <CurieIMU.h>
+#include <MadgwickAHRS.h>
 
 #define LEDBLINK_PIN  13
 int LEDBLINK_MS = 1000;
@@ -24,6 +26,11 @@ BLECharacteristic commandChar(   "301c9b21-a61b-408a-a8bf-5efcd95a3486", BLEWrit
 //BLEShortCharacteristic sideCommandChar(    "301c9b24-a61b-408a-a8bf-5efcd95a3486", BLEWrite);
 const unsigned char *cmd;
 
+BLEService orientationService("301c9b40-a61b-408a-a8bf-5efcd95a3486");
+//BLECharacteristic orientationChar(   "301c9b41-a61b-408a-a8bf-5efcd95a3486", BLERead | BLENotify, 6);
+BLEShortCharacteristic orientationChar(   "301c9b41-a61b-408a-a8bf-5efcd95a3486", BLERead | BLENotify);
+
+
 int powerPins[] = {9,3,5,6};
 //int powerPins[] = {3,2,6,9};
 //int powerPin1 = 3;
@@ -41,8 +48,13 @@ int phasePins[] = {8,2,4,7};
 short int powers[] = {0,0,0,0};
 
 short int oldBatteryLevel = 0;  // last battery level reading from analog input
-long previousMillis = 0;  // last time the battery level was checked, in ms
+long microsPrevious_batt = 0;  // last time the battery level was checked, in us
 
+Madgwick filter;
+unsigned long microsPerReading, microsPrevious_imu;
+float accelScale, gyroScale;
+float accelRange, gyroRange;
+float imuRate;
 
 void setup() {
   // put your setup code here, to run once:
@@ -61,7 +73,7 @@ void setup() {
   pinMode(powerPin4, OUTPUT);*/
   pinMode(LEDBLINK_PIN, OUTPUT);
 
-  //Serial.begin(9600);
+  Serial.begin(9600);
   
   blePeripheral.setLocalName("BLIMP");
   blePeripheral.setAdvertisedServiceUuid(batteryService.uuid());  // add the service UUID
@@ -82,6 +94,10 @@ void setup() {
   //commandService.addCharacteristic(turnCommandChar);
   //commandService.addCharacteristic(verticalCommandChar);
   //commandService.addCharacteristic(sideCommandChar);
+
+  blePeripheral.setAdvertisedServiceUuid(orientationService.uuid());
+  blePeripheral.addAttribute(orientationService);
+  blePeripheral.addAttribute(orientationChar);
   
   // assign event handlers for connected, disconnected to peripheral
   blePeripheral.setEventHandler(BLEConnected, blePeripheralConnectHandler);
@@ -107,9 +123,25 @@ void setup() {
   //sideCommandChar.setEventHandler(BLEWritten, sideCommandCharacteristicWritten);
   //sideCommandChar.setValue(0);
 
+  // start the IMU and filter
+  CurieIMU.begin();
+  CurieIMU.setGyroRate(25);
+  CurieIMU.setAccelerometerRate(25);
+  filter.begin(25);
+  // Set the accelerometer range to 2G
+  accelRange = 2;
+  CurieIMU.setAccelerometerRange(accelRange);
+  // Set the gyroscope range to 250 degrees/second
+  gyroRange = 250;
+  CurieIMU.setGyroRange(gyroRange);
+  // initialize variables to pace updates to correct rate
+  imuRate = 25;     // 25 Hz
+  microsPerReading = 1000000 / imuRate;
+  
   // start advertising
   blePeripheral.begin();
 
+  microsPrevious_imu = micros();
   //Serial.println("Bluetooth device active, waiting for connections...");
 }
 
@@ -285,11 +317,85 @@ void updateBatteryLevel() {
   }
 }
 
+/*void sendOrientation(float roll, float pitch, float yaw) {
+  short int roll_i = int(round(roll)), pitch_i = int(round(pitch)), yaw_i = int(round(yaw));
+  char roll_b[2], pitch_b[2], yaw_b[2];
+  //char roll_b[4], pitch_b[4], yaw_b[4];
+  //byte * b = (byte *) &roll;
+  //for (int i=0; i<4; i++) {
+  byte * b = (byte *) &roll_i;
+  for (int i=0; i<2; i++) {
+    roll_b[i] = b[i];
+  }
+  //b = (byte *) &pitch;
+  //for (int i=0; i<4; i++) {
+  b = (byte *) &pitch_i;
+  for (int i=0; i<2; i++) {
+    pitch_b[i] = b[i];
+  }
+  //b = (byte *) &yaw;
+  //for (int i=0; i<4; i++) {
+  b = (byte *) &yaw_i;
+  for (int i=0; i<2; i++) {
+    yaw_b[i] = b[i];
+  }
+  const char val[6] = {roll_b[0], roll_b[1], pitch_b[0], pitch_b[1], yaw_b[0], yaw_b[1]};
+  Serial.print(roll_i);
+  Serial.print(" ");
+  Serial.print(pitch_i);
+  Serial.print(" ");
+  Serial.print(yaw_i);
+  Serial.println();
+  orientationChar.setValue(val);
+}*/
+
+void sendYaw(float yaw) {
+  short int yaw_i = int(round(yaw));
+  orientationChar.setValue(yaw_i);
+}
+
 void loop() {
-  long currentMillis = millis();
+  int aix, aiy, aiz;
+  int gix, giy, giz;
+  float ax, ay, az;
+  float gx, gy, gz;
+  float roll, pitch, heading;
+  unsigned long microsNow;
+  microsNow = micros();
+
+  // check if it's time to read data and update the filter
+  if (microsNow - microsPrevious_imu >= microsPerReading) {
+    // read raw data from CurieIMU
+    unsigned long t_start = micros();
+    CurieIMU.readMotionSensor(aix, aiy, aiz, gix, giy, giz);
+
+    // convert from raw data to gravity and degrees/second units
+    ax = convertRawAcceleration(aix);
+    ay = convertRawAcceleration(aiy);
+    az = convertRawAcceleration(aiz);
+    gx = convertRawGyro(gix);
+    gy = convertRawGyro(giy);
+    gz = convertRawGyro(giz);
+
+    // update the filter, which computes orientation
+    filter.updateIMU(gx, gy, gz, ax, ay, az);
+
+    // print the heading, pitch and roll
+    roll = filter.getRoll();
+    pitch = filter.getPitch();
+    heading = filter.getYaw();
+
+    //sendOrientation(roll, pitch, heading);
+    sendYaw(heading);
+    Serial.println(micros() - t_start);
+    
+    // increment previous time, so we keep proper pace
+    microsPrevious_imu = microsNow;
+  }
+  
   // if 200ms have passed, check the battery level:
-  if (currentMillis - previousMillis >= 200) {
-    previousMillis = currentMillis;
+  if (microsNow - microsPrevious_batt >= 200000) {
+    microsPrevious_batt = microsNow;
     updateBatteryLevel();
   }
   blePeripheral.poll();
@@ -318,4 +424,22 @@ void ledBlink()
     // Reset "next time to toggle" time.
     ledBlinkTime = millis()+LEDBLINK_MS;
   }
+}
+
+float convertRawAcceleration(int aRaw) {
+  // since we are using 2G range
+  // -2g maps to a raw value of -32768
+  // +2g maps to a raw value of 32767
+  
+  float a = (aRaw * accelRange) / 32768.0;
+  return a;
+}
+
+float convertRawGyro(int gRaw) {
+  // since we are using 250 degrees/seconds range
+  // -250 maps to a raw value of -32768
+  // +250 maps to a raw value of 32767
+  
+  float g = (gRaw * gyroRange) / 32768.0;
+  return g;
 }
