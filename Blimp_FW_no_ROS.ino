@@ -46,6 +46,7 @@ int phasePins[] = {8,2,4,7};
 //int phasePin4 = 8;
 
 short int powers[] = {0,0,0,0};
+short int commands[] = {0,0,0,0};
 
 short int oldBatteryLevel = 0;  // last battery level reading from analog input
 long microsPrevious_batt = 0;  // last time the battery level was checked, in us
@@ -55,6 +56,22 @@ unsigned long microsPerReading, microsPrevious_imu;
 float accelScale, gyroScale;
 float accelRange, gyroRange;
 float imuRate;
+
+// PID for yaw
+float Kp, Ki, Kd;
+float plant_state;
+int control_effort;
+float setpoint = 0., offset = -360.;
+long microsPrevious_pid = 0, delta_t;
+float error_integral = 0;
+float P = 0;
+float I = 0;
+float D = 0;
+float angle_wrap = 360.0;
+float tan_filt = 1.;
+int upper_limit = 255, lower_limit = -255;
+float windup_limit = 255.;
+float error[3] = {0.,0.,0.}, filtered_error[3] = {0.,0.,0.}, error_deriv[3] = {0.,0.,0.}, filtered_error_deriv[3] = {0.,0.,0.};
 
 void setup() {
   // put your setup code here, to run once:
@@ -123,6 +140,11 @@ void setup() {
   //sideCommandChar.setEventHandler(BLEWritten, sideCommandCharacteristicWritten);
   //sideCommandChar.setValue(0);
 
+  // PID controller
+  Kp = 0.01;
+  Ki = 0.;
+  Kd = 0.3;
+
   // start the IMU and filter
   CurieIMU.begin();
   CurieIMU.setGyroRate(25);
@@ -137,12 +159,76 @@ void setup() {
   // initialize variables to pace updates to correct rate
   imuRate = 25;     // 25 Hz
   microsPerReading = 1000000 / imuRate;
+
+  // Values from upright, static calibration
+  // autoCalibration on the blimp seems not a good choice as it is hard to keep the IMU upright and static
+  CurieIMU.setAccelerometerOffset(X_AXIS,97.50);
+  CurieIMU.setAccelerometerOffset(Y_AXIS,97.50);
+  CurieIMU.setAccelerometerOffset(Z_AXIS,70.20);
+  CurieIMU.setGyroOffset(X_AXIS,1.52);
+  CurieIMU.setGyroOffset(Y_AXIS,0.00);
+  CurieIMU.setGyroOffset(Z_AXIS,-0.37);
   
   // start advertising
   blePeripheral.begin();
 
   microsPrevious_imu = micros();
   //Serial.println("Bluetooth device active, waiting for connections...");
+}
+
+void get_control_effort(float yaw) {
+  plant_state = yaw;
+  error[2] = error[1];
+  error[1] = error[0];
+  error[0] = setpoint - plant_state;
+
+  while (error[0] < -angle_wrap/2.0)
+    error[0] += angle_wrap;
+  while (error[0] > angle_wrap/2.0)
+    error[0] -= angle_wrap;
+  error[2] = 0.;
+  error[1] = 0.;
+  error_integral = 0.;        // Still feel weird here
+
+  if (microsPrevious_pid != 0) {    // Not the first time
+    long now = micros();
+    delta_t = now - microsPrevious_pid;
+    microsPrevious_pid = now;
+    if (delta_t == 0)
+      return;
+  }
+  else {
+    microsPrevious_pid = micros();
+    return;
+  }
+
+  error_integral += error[0] * delta_t*1.0e-6;   // microsec
+  error_integral = min(max(error_integral, -windup_limit), windup_limit);
+
+  // filter
+  filtered_error[2] = filtered_error[1];
+  filtered_error[1] = filtered_error[0];
+  filtered_error[0] = (1/3.414)*(error[2]+2*error[1]+error[0]-(0.586)*filtered_error[2]);
+
+  error_deriv[2] = error_deriv[1];
+  error_deriv[1] = error_deriv[0];
+  error_deriv[0] = (error[0] - error[1])/delta_t * 1.0e6;
+
+  filtered_error_deriv[2] = filtered_error_deriv[1];
+  filtered_error_deriv[1] = filtered_error_deriv[0];
+  filtered_error_deriv[0] = (1/(3.414))*(error_deriv[2]+2*error_deriv[1]+error_deriv[0]-(0.586)*filtered_error_deriv[2]);
+
+  // Control effort
+  P = Kp * filtered_error[0];
+  I = Ki * error_integral;
+  D = Kd * filtered_error_deriv[0];
+  float temp_control = P + I + D;
+  
+  temp_control = min(max(temp_control, lower_limit), upper_limit);
+  control_effort = round(temp_control);
+
+  powers[0] = max(min(-commands[0] + control_effort, 255),-255);
+  powers[1] = max(min(commands[0] + control_effort, 255),-255);
 }
 
 void blePeripheralConnectHandler(BLECentral& central) {
@@ -257,21 +343,20 @@ void m4CharacteristicWritten(BLEDevice central, BLECharacteristic characteristic
 
 void commandCharacteristicWritten(BLECentral& central, BLECharacteristic& characteristic) {
   cmd = characteristic.value();
-  short int commands[4];
   for (int i=0; i<4; i++) {
     commands[i] = cmd[2*i] << 8 | cmd[2*i+1];
     //Serial.print(commands[i]);
     //Serial.print(" ");
   }
   //Serial.println();
-  
-  powers[0] = max(min(-commands[0] + commands[1], 255),-255);
-  powers[1] = max(min(commands[0] + commands[1], 255),-255);
+
+  setpoint = float(commands[1]);
+  powers[0] = max(min(-commands[0] + control_effort, 255),-255);
+  powers[1] = max(min(commands[0] + control_effort, 255),-255);
   powers[2] = commands[2];
   powers[3] = commands[3];
   //power1 = frontCommandChar.value();
   //power2 = frontCommandChar.value();
-  driveMotors();
 }
 
 /*
@@ -384,10 +469,23 @@ void loop() {
     roll = filter.getRoll();
     pitch = filter.getPitch();
     heading = filter.getYaw();
+    if (offset == -360.) {
+      offset = heading;
+    }
+    heading -= offset;
+    while (heading < -angle_wrap/2.0)
+      heading += angle_wrap;
+    while (heading > angle_wrap/2.0)
+      heading -= angle_wrap;
+
+    Serial.println(heading);
+    get_control_effort(heading);
+    //Serial.println(control_effort);
+    driveMotors();
 
     //sendOrientation(roll, pitch, heading);
     sendYaw(heading);
-    Serial.println(micros() - t_start);
+    //Serial.println(micros() - t_start);
     
     // increment previous time, so we keep proper pace
     microsPrevious_imu = microsNow;
